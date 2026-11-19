@@ -1,106 +1,98 @@
-"""Pure image-processing functions for the Digit Pixelation Visualizer.
-
-No Streamlit imports here: every function takes arrays in and returns arrays/images out.
-"""
-from __future__ import annotations
-
-import math
+from typing import Tuple
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-GRID_SIZE: int = 32
-PADDING_RATIO: float = 0.20  # 20% extra space around the digit's bounding box
-
-
-def _to_grayscale(arr: np.ndarray) -> np.ndarray:
-    """Step 1: collapse an RGBA/RGB/gray array into a single-channel uint8 image.
-
-    White stroke on black background -> stroke is high intensity, background is 0.
-    """
-    arr = np.asarray(arr)
-    if arr.ndim == 2:
-        return arr.astype(np.uint8)
-    if arr.ndim == 3 and arr.shape[2] == 4:
-        # Composite onto black using alpha so transparent pixels become 0.
-        rgb = arr[..., :3].astype(np.float32)
-        alpha = arr[..., 3:4].astype(np.float32) / 255.0
-        rgb = rgb * alpha
-        return cv2.cvtColor(np.clip(rgb, 0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    if arr.ndim == 3 and arr.shape[2] == 3:
-        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    raise ValueError(f"Unsupported array shape: {arr.shape}")
-
 
 def process_digit(raw_rgba_array: np.ndarray) -> np.ndarray:
-    """Convert a raw canvas drawing into a centered 32x32 uint8 grayscale array."""
-    # 1. Grayscale conversion.
-    gray = _to_grayscale(raw_rgba_array)
+    """Convert an RGBA/gray canvas image to a centered 32x32 uint8 grayscale array."""
+    if raw_rgba_array is None:
+        return np.zeros((32, 32), dtype=np.uint8)
 
-    # 2. Threshold + bounding box of all drawn (non-zero) pixels.
-    ys, xs = np.nonzero(gray > 0)
-    if ys.size == 0:
-        return np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)  # nothing drawn
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    crop = gray[y0:y1, x0:x1]
-    h, w = crop.shape
+    source = np.asarray(raw_rgba_array)
+    if source.ndim == 2:
+        gray = source.astype(np.uint8)
+    elif source.ndim == 3:
+        if source.shape[2] == 4:
+            # Canvas RGBA: RGB luminance plus alpha. Alpha also makes a composited
+            # white-on-black stroke usable while ignoring a transparent background.
+            rgb = source[:, :, :3].astype(np.float32)
+            alpha = source[:, :, 3:4].astype(np.float32) / 255.0
+            gray = (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]) * alpha
+            gray = np.clip(gray, 0, 255).astype(np.uint8)
+        elif source.shape[2] == 3:
+            gray = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        else:
+            return np.zeros((32, 32), dtype=np.uint8)
+    else:
+        return np.zeros((32, 32), dtype=np.uint8)
 
-    # 3. Center the digit: place the cropped ink in the middle of a square canvas whose
-    #    side is the longer bbox edge plus ~20% margin (bounding-box-center centering,
-    #    MNIST-style). This keeps the aspect ratio and equal space on all sides.
-    side = max(1, math.ceil(max(h, w) * (1.0 + PADDING_RATIO)))
-    square = np.zeros((side, side), dtype=np.uint8)
-    top = (side - h) // 2
-    left = (side - w) // 2
-    square[top:top + h, left:left + w] = crop
+    # Step 2: threshold/bounding box based on actual nonzero ink.
+    ys, xs = np.nonzero(gray)
+    if xs.size == 0:
+        return np.zeros((32, 32), dtype=np.uint8)
 
-    # 4. Resize to 32x32 with area-based downsampling for anti-aliased intensities.
-    #    (INTER_AREA is meant for shrinking; fall back to LANCZOS if the square is tiny.)
-    interp = cv2.INTER_AREA if side >= GRID_SIZE else cv2.INTER_LANCZOS4
-    small = cv2.resize(square, (GRID_SIZE, GRID_SIZE), interpolation=interp)
+    x_min, x_max = int(xs.min()), int(xs.max())
+    y_min, y_max = int(ys.min()), int(ys.max())
+    crop = gray[y_min:y_max + 1, x_min:x_max + 1]
 
-    # 5. Return uint8 values 0-255.
-    return np.clip(small, 0, 255).astype(np.uint8)
+    # Step 3: center the ink in a square, with 20% padding on the longest side.
+    height, width = crop.shape
+    side = int(np.ceil(max(height, width) * 1.20))
+    side = max(side, 1)
+    padded = np.zeros((side, side), dtype=np.uint8)
+    y_offset = (side - height) // 2
+    x_offset = (side - width) // 2
+    padded[y_offset:y_offset + height, x_offset:x_offset + width] = crop
 
-
-def _load_font(size: int) -> ImageFont.ImageFont:
-    """Load a small font, falling back gracefully across Pillow versions/platforms."""
-    for name in ("DejaVuSans.ttf", "arial.ttf", "Arial.ttf"):
-        try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            continue
-    try:
-        return ImageFont.load_default(size=size)  # Pillow >= 10.1
-    except TypeError:
-        return ImageFont.load_default()
+    # Step 4: area downsampling preserves proper intermediate grayscale values.
+    resized = cv2.resize(padded, (32, 32), interpolation=cv2.INTER_AREA)
+    return np.clip(resized, 0, 255).astype(np.uint8)
 
 
 def render_pixel_grid_with_values(pixel_array: np.ndarray, upscale_to: int = 320) -> Image.Image:
-    """Render a 32x32 array as a crisp block grid with each cell's 0-255 value overlaid."""
-    arr = np.asarray(pixel_array, dtype=np.uint8)
-    n = arr.shape[0]
+    """Render a 32x32 pixel array with crisp blocks, grid lines, and intensity text."""
+    pixels = np.asarray(pixel_array)
+    if pixels.shape != (32, 32):
+        raise ValueError("pixel_array must have shape (32, 32)")
+    pixels = np.clip(pixels, 0, 255).astype(np.uint8)
 
-    # Upscale with nearest-neighbor so each cell stays a crisp, un-blurred block.
-    img = Image.fromarray(arr, mode="L").resize((upscale_to, upscale_to), Image.NEAREST).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    cell = upscale_to / n
+    # Overlay: nearest-neighbor scaling keeps every 32x32 block crisp.
+    source = Image.fromarray(pixels, mode="L")
+    scaled = source.resize((upscale_to, upscale_to), resample=Image.Resampling.NEAREST)
+    grid = Image.merge("RGB", (scaled, scaled, scaled))
+    draw = ImageDraw.Draw(grid)
 
-    # Thin grid lines between cells.
-    grid_color = (70, 70, 70)
-    for i in range(1, n):
-        p = round(i * cell)
-        draw.line([(p, 0), (p, upscale_to)], fill=grid_color, width=1)
-        draw.line([(0, p), (upscale_to, p)], fill=grid_color, width=1)
+    cell_size = upscale_to // 32
 
-    # Intensity text centered in each cell; white on dark cells, black on light cells.
-    font = _load_font(7)
-    for r in range(n):
-        for c in range(n):
-            v = int(arr[r, c])
-            color = (255, 255, 255) if v < 128 else (0, 0, 0)
-            cx, cy = (c + 0.5) * cell, (r + 0.5) * cell
-            draw.text((cx, cy), str(v), fill=color, font=font, anchor="mm")
-    return img
+    # Thin grid lines between all 32x32 cells.
+    for index in range(33):
+        position = index * cell_size
+        draw.line((position, 0, position, upscale_to), fill=(96, 96, 96), width=1)
+        draw.line((0, position, upscale_to, position), fill=(96, 96, 96), width=1)
+
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", size=7)
+    except OSError:
+        font = ImageFont.load_default()
+
+    # Draw the original intensity in a contrasting color in each cell.
+    for row in range(32):
+        for col in range(32):
+            value = int(pixels[row, col])
+            text = str(value)
+            text_color = (255, 255, 255) if value < 128 else (0, 0, 0)
+            box = draw.textbbox((0, 0), text, font=font)
+            text_width = box[2] - box[0]
+            text_height = box[3] - box[1]
+            center_x = col * cell_size + cell_size // 2
+            center_y = row * cell_size + cell_size // 2
+            draw.text(
+                (center_x - text_width // 2, center_y - text_height // 2),
+                text,
+                fill=text_color,
+                font=font,
+            )
+
+    return grid
